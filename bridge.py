@@ -35,7 +35,8 @@ DEFAULT_CONFIG = {
     "agent_name": os.getenv("MINIVERSE_AGENT_NAME", "Hermes Agent"),
     "agent_color": os.getenv("MINIVERSE_AGENT_COLOR", "#CD7F32"),
     "bridge_port": int(os.getenv("MINIVERSE_BRIDGE_PORT", "4567")),
-    "hermes_cmd": os.getenv("MINIVERSE_HERMES_CMD", "hermes chat -c -q"),
+    "hermes_webhook_url": os.getenv("HERMES_WEBHOOK_URL", ""),  # e.g. http://localhost:4568
+    "hermes_cmd": os.getenv("MINIVERSE_HERMES_CMD", "hermes chat -c -q"),  # CLI fallback
     "heartbeat_interval": 20,
     "speak_responses": True,  # speak agent responses in miniverse
 }
@@ -175,50 +176,68 @@ def handle_incoming_message(from_agent: str, message: str, config: dict,
                             client: MiniverseClient, bridge_state: BridgeState):
     """Process an incoming message from another miniverse agent.
 
-    Injects the message into Hermes via CLI, captures the response,
-    and speaks it back in the miniverse.
+    Routes the message to Hermes via the webhook adapter (gateway mode)
+    or falls back to CLI injection. The webhook adapter maintains proper
+    sessions per agent — no race conditions, no session fighting.
     """
     log.info("Message from %s: %s", from_agent, message[:80])
     bridge_state.update("thinking", f"Reading message from {from_agent}")
 
-    # Format the message for hermes
-    hermes_input = (
-        f"[Miniverse message from agent '{from_agent}']: {message}\n\n"
-        f"(You are in a Miniverse pixel world. Reply naturally. "
-        f"To respond in the world, just reply — the bridge will deliver it.)"
-    )
+    hermes_url = config.get("hermes_webhook_url")
+    agent_id = config["agent_id"]
 
-    # Inject into hermes via CLI
-    cmd = config["hermes_cmd"].split() + [hermes_input]
-    bridge_state.update("working", f"Responding to {from_agent}")
-
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            cwd=os.path.expanduser("~"),
+    if hermes_url:
+        # Gateway mode: POST to the webhook adapter (proper sessions)
+        bridge_state.update("working", f"Responding to {from_agent}")
+        try:
+            resp = httpx.post(
+                f"{hermes_url}/message",
+                json={
+                    "chat_id": agent_id,
+                    "message": message,
+                    "from": from_agent,
+                    "user_id": from_agent,
+                },
+                timeout=300,
+            )
+            data = resp.json()
+            response = data.get("response", "")
+            if not response:
+                response = "(No response from agent)"
+        except httpx.TimeoutException:
+            response = "(Sorry, I took too long thinking about that!)"
+            log.warning("Hermes webhook timed out for message from %s", from_agent)
+        except Exception as e:
+            response = f"(Error communicating with Hermes: {e})"
+            log.error("Webhook POST failed: %s", e)
+    else:
+        # Fallback: CLI injection (single-agent only, no concurrency)
+        log.warning("No HERMES_WEBHOOK_URL set — using CLI fallback (not recommended for multi-agent)")
+        hermes_input = (
+            f"[Miniverse message from agent '{from_agent}']: {message}\n\n"
+            f"(You are in a Miniverse pixel world. Reply naturally.)"
         )
-        response = result.stdout.strip()
-        if not response and result.stderr:
-            log.warning("Hermes stderr: %s", result.stderr[:200])
-            response = "(I had trouble processing that, sorry!)"
-    except subprocess.TimeoutExpired:
-        response = "(Sorry, I took too long thinking about that!)"
-        log.warning("Hermes timed out processing message from %s", from_agent)
-    except FileNotFoundError:
-        response = "(Hermes CLI not found — is it installed?)"
-        log.error("hermes command not found: %s", config["hermes_cmd"])
-    except Exception as e:
-        response = f"(Error: {e})"
-        log.error("Failed to run hermes: %s", e)
+        cmd = config["hermes_cmd"].split() + [hermes_input]
+        bridge_state.update("working", f"Responding to {from_agent}")
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120,
+                cwd=os.path.expanduser("~"),
+            )
+            response = result.stdout.strip()
+            if not response:
+                response = "(I had trouble processing that, sorry!)"
+        except subprocess.TimeoutExpired:
+            response = "(Sorry, I took too long thinking about that!)"
+        except FileNotFoundError:
+            response = "(Hermes CLI not found — is it installed?)"
+        except Exception as e:
+            response = f"(Error: {e})"
 
     # Send response back via miniverse
     if response:
-        # Send as a DM so it lands in their inbox
         client.message(from_agent, response[:500])
-        # Also speak it so it's visible in the world
         if config.get("speak_responses"):
             client.speak(response[:200], to=from_agent)
 
@@ -331,8 +350,10 @@ def main():
                         help="Agent color (hex)")
     parser.add_argument("--port", type=int, default=DEFAULT_CONFIG["bridge_port"],
                         help="Local port for webhook callbacks")
+    parser.add_argument("--hermes-webhook", default=DEFAULT_CONFIG["hermes_webhook_url"],
+                        help="Hermes webhook adapter URL (e.g. http://localhost:4568)")
     parser.add_argument("--hermes-cmd", default=DEFAULT_CONFIG["hermes_cmd"],
-                        help="Command to inject messages into hermes")
+                        help="CLI fallback command (used when --hermes-webhook not set)")
     parser.add_argument("--no-speak", action="store_true",
                         help="Don't speak responses in the world")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -351,6 +372,7 @@ def main():
         "agent_name": args.name,
         "agent_color": args.color,
         "bridge_port": args.port,
+        "hermes_webhook_url": args.hermes_webhook or "",
         "hermes_cmd": args.hermes_cmd,
         "speak_responses": not args.no_speak,
     }

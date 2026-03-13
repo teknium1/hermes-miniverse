@@ -1,0 +1,10 @@
+name: miniverse
+description: >
+  Broadcasts Hermes agent state to a Miniverse pixel world via the
+  hermes-miniverse bridge. Translates agent lifecycle events into
+  miniverse heartbeats and actions.
+
+events:
+  - agent:start
+  - agent:step
+  - agent:end

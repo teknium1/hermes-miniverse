@@ -187,13 +187,16 @@ def handle_incoming_message(from_agent: str, message: str, config: dict,
     agent_id = config["agent_id"]
 
     if hermes_url:
-        # Gateway mode: POST to the webhook adapter (proper sessions)
+        # Gateway mode: POST to the webhook adapter (proper sessions).
+        # Use agent_id:from_agent as chat_id so each sender gets their own
+        # session — otherwise all conversations pile into one.
+        conversation_id = f"{agent_id}:{from_agent}"
         bridge_state.update("working", f"Responding to {from_agent}")
         try:
             resp = httpx.post(
                 f"{hermes_url}/message",
                 json={
-                    "chat_id": agent_id,
+                    "chat_id": conversation_id,
                     "message": message,
                     "from": from_agent,
                     "user_id": from_agent,
